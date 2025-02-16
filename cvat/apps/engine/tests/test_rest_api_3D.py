@@ -1,9 +1,12 @@
 # Copyright (C) 2020-2022 Intel Corporation
+# Copyright (C) CVAT.ai Corporation
 #
 # SPDX-License-Identifier: MIT
 
 
+import copy
 import io
+import itertools
 import os
 import os.path as osp
 import tempfile
@@ -12,43 +15,22 @@ import zipfile
 from collections import defaultdict
 from glob import glob
 from io import BytesIO
-import copy
 from shutil import copyfile
-import itertools
 
 from django.contrib.auth.models import Group, User
 from rest_framework import status
-from rest_framework.test import APIClient, APITestCase
 
-from cvat.apps.engine.media_extractors import ValidateDimension
 from cvat.apps.dataset_manager.task import TaskAnnotation
-from datumaro.util.test_utils import TestDir
+from cvat.apps.dataset_manager.tests.utils import TestDir
+from cvat.apps.engine.media_extractors import ValidateDimension
+from cvat.apps.engine.tests.utils import ApiTestBase, ForceLogin, get_paginated_collection
 
 CREATE_ACTION = "create"
 UPDATE_ACTION = "update"
 DELETE_ACTION = "delete"
 
 
-class ForceLogin:
-    def __init__(self, user, client):
-        self.user = user
-        self.client = client
-
-    def __enter__(self):
-        if self.user:
-            self.client.force_login(self.user,
-                backend='django.contrib.auth.backends.ModelBackend')
-
-        return self
-
-    def __exit__(self, exception_type, exception_value, traceback):
-        if self.user:
-            self.client.logout()
-
-class _DbTestBase(APITestCase):
-    def setUp(self):
-        self.client = APIClient()
-
+class _DbTestBase(ApiTestBase):
     @classmethod
     def setUpTestData(cls):
         cls.create_db_users()
@@ -103,11 +85,22 @@ class _DbTestBase(APITestCase):
             assert response.status_code == status.HTTP_201_CREATED, response.status_code
             tid = response.data["id"]
 
-            response = self.client.post("/api/tasks/%s/data" % tid,
-                data=image_data)
+            response = self.client.post("/api/tasks/%s/data" % tid, data=image_data)
             assert response.status_code == status.HTTP_202_ACCEPTED, response.status_code
+            rq_id = response.json()["rq_id"]
+
+            response = self.client.get(f"/api/requests/{rq_id}")
+            assert response.status_code == status.HTTP_200_OK, response.status_code
+            assert response.json()["status"] == "finished", response.json().get("status")
 
             response = self.client.get("/api/tasks/%s" % tid)
+
+            if 200 <= response.status_code < 400:
+                labels_response = list(get_paginated_collection(
+                    lambda page: self.client.get("/api/labels?task_id=%s&page=%s" % (tid, page))
+                ))
+                response.data["labels"] = labels_response
+
             task = response.data
 
         return task
@@ -140,8 +133,10 @@ class _DbTestBase(APITestCase):
 
     def _get_jobs(self, task_id):
         with ForceLogin(self.admin, self.client):
-            response = self.client.get("/api/tasks/{}/jobs".format(task_id))
-        return response.data
+            values = get_paginated_collection(lambda page:
+                self.client.get("/api/jobs?task_id={}&page={}".format(task_id, page))
+            )
+        return values
 
     def _get_request(self, path, user):
         with ForceLogin(user, self.client):
@@ -161,7 +156,7 @@ class _DbTestBase(APITestCase):
     def _download_file(self, url, data, user, file_name):
         response = self._get_request_with_data(url, data, user)
         self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
-        response = self._get_request_with_data(url, data, user)
+        response = self._get_request_with_data(url, {**data, "action": "download"}, user)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
         content = BytesIO(b"".join(response.streaming_content))
@@ -347,6 +342,7 @@ class Task3DTest(_DbTestBase):
                 {
                     "type": "cuboid",
                     "occluded": False,
+                    "outside": False,
                     "z_order": 0,
                     "points": [0.16, 0.20, -0.26, 0, -0.14, 0, 4.84, 4.48, 4.12, 0, 0, 0, 0, 0, 0, 0],
                     "rotation": 0,
@@ -354,6 +350,7 @@ class Task3DTest(_DbTestBase):
                     "label_id": None,
                     "group": 0,
                     "source": "manual",
+                    "elements": [],
                     "attributes": []
                 },
             ],
@@ -533,6 +530,8 @@ class Task3DTest(_DbTestBase):
 
                 for user, edata in list(self.expected_dump_upload.items()):
                     with self.subTest(format=f"{format_name}_{edata['name']}_dump"):
+                        self._clear_temp_data() # clean up from previous tests and iterations
+
                         url = self._generate_url_dump_tasks_annotations(task_id)
                         file_name = osp.join(test_dir, f"{format_name}_{edata['name']}.zip")
 
@@ -587,7 +586,6 @@ class Task3DTest(_DbTestBase):
                     file_name = osp.join(test_dir, f"{format_name}.zip")
                     data = {
                         "format": format_name,
-                        "action": "download",
                     }
                     self._download_file(url, data, self.admin, file_name)
                     self.assertTrue(osp.exists(file_name))
@@ -626,7 +624,6 @@ class Task3DTest(_DbTestBase):
                     file_name = osp.join(test_dir, f"{format_name}.zip")
                     data = {
                         "format": format_name,
-                        "action": "download",
                     }
                     self._download_file(url, data, self.admin, file_name)
                     self.assertTrue(osp.exists(file_name))
@@ -667,7 +664,6 @@ class Task3DTest(_DbTestBase):
                     file_name = osp.join(test_dir, f"{format_name}.zip")
                     data = {
                         "format": format_name,
-                        "action": "download",
                     }
                     self._download_file(url, data, self.admin, file_name)
 
@@ -691,7 +687,6 @@ class Task3DTest(_DbTestBase):
                     file_name = osp.join(test_dir, f"{format_name}.zip")
                     data = {
                         "format": format_name,
-                        "action": "download",
                     }
                     self._download_file(url, data, self.admin, file_name)
                     self.assertTrue(osp.exists(file_name))
@@ -726,6 +721,8 @@ class Task3DTest(_DbTestBase):
 
                 for user, edata in list(self.expected_dump_upload.items()):
                     with self.subTest(format=f"{format_name}_{edata['name']}_export"):
+                        self._clear_temp_data() # clean up from previous tests and iterations
+
                         url = self._generate_url_dump_dataset(task_id)
                         file_name = osp.join(test_dir, f"{format_name}_{edata['name']}.zip")
 
@@ -746,6 +743,8 @@ class Task3DTest(_DbTestBase):
                             content = io.BytesIO(b"".join(response.streaming_content))
                             with open(file_name, "wb") as f:
                                 f.write(content.getvalue())
-                        self.assertEqual(osp.exists(file_name), edata['file_exists'])
-                        self._check_dump_content(content, task_ann_prev.data, format_name,related_files=False)
+                            self.assertEqual(osp.exists(file_name), edata['file_exists'])
+                            self._check_dump_content(
+                                content, task_ann_prev.data, format_name, related_files=False
+                            )
 

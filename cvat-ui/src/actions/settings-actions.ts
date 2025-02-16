@@ -1,11 +1,19 @@
-// Copyright (C) 2020-2021 Intel Corporation
+// Copyright (C) 2020-2022 Intel Corporation
+// Copyright (C) CVAT.ai Corporation
 //
 // SPDX-License-Identifier: MIT
 
+import _ from 'lodash';
 import { AnyAction } from 'redux';
+import { ThunkAction } from 'utils/redux';
 import {
     GridColor, ColorBy, SettingsState, ToolsBlockerState,
-} from 'reducers/interfaces';
+    CombinedState,
+} from 'reducers';
+import { ImageFilter, ImageFilterAlias, SerializedImageFilter } from 'utils/image-processing';
+import { conflict, conflictDetector } from 'utils/conflict-detector';
+import GammaCorrection, { GammaFilterOptions } from 'utils/fabric-wrapper/gamma-correciton';
+import { shortcutsActions } from './shortcuts-actions';
 
 export enum SettingsActionTypes {
     SWITCH_ROTATE_ALL = 'SWITCH_ROTATE_ALL',
@@ -19,11 +27,13 @@ export enum SettingsActionTypes {
     CHANGE_SHAPES_OUTLINED_BORDERS = 'CHANGE_SHAPES_OUTLINED_BORDERS',
     CHANGE_SHAPES_SHOW_PROJECTIONS = 'CHANGE_SHAPES_SHOW_PROJECTIONS',
     CHANGE_SHOW_UNLABELED_REGIONS = 'CHANGE_SHOW_UNLABELED_REGIONS',
+    CHANGE_SHOW_GROUND_TRUTH = 'CHANGE_SHOW_GROUND_TRUTH',
     CHANGE_FRAME_STEP = 'CHANGE_FRAME_STEP',
     CHANGE_FRAME_SPEED = 'CHANGE_FRAME_SPEED',
     SWITCH_RESET_ZOOM = 'SWITCH_RESET_ZOOM',
     SWITCH_SMOOTH_IMAGE = 'SWITCH_SMOOTH_IMAGE',
     SWITCH_TEXT_FONT_SIZE = 'SWITCH_TEXT_FONT_SIZE',
+    SWITCH_CONTROL_POINTS_SIZE = 'SWITCH_CONTROL_POINTS_SIZE',
     SWITCH_TEXT_POSITION = 'SWITCH_TEXT_POSITION',
     SWITCH_TEXT_CONTENT = 'SWITCH_TEXT_CONTENT',
     CHANGE_BRIGHTNESS_LEVEL = 'CHANGE_BRIGHTNESS_LEVEL',
@@ -41,6 +51,11 @@ export enum SettingsActionTypes {
     SWITCH_SETTINGS_DIALOG = 'SWITCH_SETTINGS_DIALOG',
     SET_SETTINGS = 'SET_SETTINGS',
     SWITCH_TOOLS_BLOCKER_STATE = 'SWITCH_TOOLS_BLOCKER_STATE',
+    SWITCH_SHOWING_DELETED_FRAMES = 'SWITCH_SHOWING_DELETED_FRAMES',
+    SWITCH_SHOWING_TAGS_ON_FRAME = 'SWITCH_SHOWING_TAGS_ON_FRAME',
+    ENABLE_IMAGE_FILTER = 'ENABLE_IMAGE_FILTER',
+    DISABLE_IMAGE_FILTER = 'DISABLE_IMAGE_FILTER',
+    RESET_IMAGE_FILTERS = 'RESET_IMAGE_FILTERS',
 }
 
 export function changeShapesOpacity(opacity: number): AnyAction {
@@ -66,6 +81,15 @@ export function changeShapesColorBy(colorBy: ColorBy): AnyAction {
         type: SettingsActionTypes.CHANGE_SHAPES_COLOR_BY,
         payload: {
             colorBy,
+        },
+    };
+}
+
+export function changeShowGroundTruth(showGroundTruth: boolean): AnyAction {
+    return {
+        type: SettingsActionTypes.CHANGE_SHOW_GROUND_TRUTH,
+        payload: {
+            showGroundTruth,
         },
     };
 }
@@ -188,6 +212,15 @@ export function switchTextFontSize(fontSize: number): AnyAction {
     };
 }
 
+export function switchControlPointsSize(pointsSize: number): AnyAction {
+    return {
+        type: SettingsActionTypes.SWITCH_CONTROL_POINTS_SIZE,
+        payload: {
+            controlPointsSize: pointsSize,
+        },
+    };
+}
+
 export function switchTextPosition(position: 'auto' | 'center'): AnyAction {
     return {
         type: SettingsActionTypes.SWITCH_TEXT_POSITION,
@@ -197,11 +230,11 @@ export function switchTextPosition(position: 'auto' | 'center'): AnyAction {
     };
 }
 
-export function switchTextContent(textContent: string): AnyAction {
+export function switchTextContent(textContent: string[]): AnyAction {
     return {
         type: SettingsActionTypes.SWITCH_TEXT_CONTENT,
         payload: {
-            textContent,
+            textContent: textContent.join(','),
         },
     };
 }
@@ -305,12 +338,10 @@ export function changeCanvasBackgroundColor(color: string): AnyAction {
     };
 }
 
-export function switchSettingsDialog(show?: boolean): AnyAction {
+export function switchSettingsModalVisible(visible: boolean): AnyAction {
     return {
         type: SettingsActionTypes.SWITCH_SETTINGS_DIALOG,
-        payload: {
-            show,
-        },
+        payload: { visible },
     };
 }
 
@@ -339,4 +370,143 @@ export function setSettings(settings: Partial<SettingsState>): AnyAction {
             settings,
         },
     };
+}
+
+export function switchShowingDeletedFrames(showDeletedFrames: boolean): AnyAction {
+    return {
+        type: SettingsActionTypes.SWITCH_SHOWING_DELETED_FRAMES,
+        payload: {
+            showDeletedFrames,
+        },
+    };
+}
+
+export function switchShowingTagsOnFrame(showTagsOnFrame: boolean): AnyAction {
+    return {
+        type: SettingsActionTypes.SWITCH_SHOWING_TAGS_ON_FRAME,
+        payload: {
+            showTagsOnFrame,
+        },
+    };
+}
+
+export function enableImageFilter(filter: ImageFilter, options: object | null = null): AnyAction {
+    return {
+        type: SettingsActionTypes.ENABLE_IMAGE_FILTER,
+        payload: {
+            filter,
+            options,
+        },
+    };
+}
+
+export function disableImageFilter(filterAlias: ImageFilterAlias): AnyAction {
+    return {
+        type: SettingsActionTypes.DISABLE_IMAGE_FILTER,
+        payload: {
+            filterAlias,
+        },
+    };
+}
+
+export function resetImageFilters(): AnyAction {
+    return {
+        type: SettingsActionTypes.RESET_IMAGE_FILTERS,
+        payload: {},
+    };
+}
+
+export function restoreSettingsAsync(): ThunkAction {
+    return async (dispatch, getState): Promise<void> => {
+        const state: CombinedState = getState();
+        const { settings, shortcuts } = state;
+
+        dispatch(shortcutsActions.setDefaultShortcuts(structuredClone(shortcuts.keyMap)));
+
+        const settingsString = localStorage.getItem('clientSettings') as string;
+        if (!settingsString) return;
+
+        const loadedSettings = JSON.parse(settingsString);
+        const newSettings = {
+            player: settings.player,
+            workspace: settings.workspace,
+            imageFilters: [],
+        } as Pick<SettingsState, 'player' | 'workspace' | 'imageFilters'>;
+
+        Object.entries(_.pick(newSettings, ['player', 'workspace'])).forEach(([sectionKey, section]) => {
+            for (const key of Object.keys(section)) {
+                const settedValue = loadedSettings[sectionKey]?.[key];
+                if (settedValue !== undefined) {
+                    Object.defineProperty(newSettings[sectionKey as 'player' | 'workspace'], key, { value: settedValue });
+                }
+            }
+        });
+
+        if ('imageFilters' in loadedSettings) {
+            loadedSettings.imageFilters.forEach((filter: SerializedImageFilter) => {
+                if (filter.alias === ImageFilterAlias.GAMMA_CORRECTION) {
+                    const modifier = new GammaCorrection(filter.params as GammaFilterOptions);
+                    newSettings.imageFilters.push({
+                        modifier,
+                        alias: ImageFilterAlias.GAMMA_CORRECTION,
+                    });
+                }
+            });
+        }
+
+        dispatch(setSettings(newSettings));
+
+        if ('shortcuts' in loadedSettings) {
+            const updateKeyMap = structuredClone(shortcuts.keyMap);
+            for (const [key, value] of Object.entries(loadedSettings.shortcuts.keyMap)) {
+                if (key in updateKeyMap) {
+                    updateKeyMap[key].sequences = (value as { sequences: string[] }).sequences;
+                }
+            }
+
+            for (const key of Object.keys(updateKeyMap)) {
+                const currValue = {
+                    [key]: { ...updateKeyMap[key] },
+                };
+                const conflictingShortcuts = conflictDetector(currValue, shortcuts.keyMap);
+                if (conflictingShortcuts) {
+                    for (const conflictingShortcut of Object.keys(conflictingShortcuts)) {
+                        for (const sequence of currValue[key].sequences) {
+                            for (const conflictingSequence of conflictingShortcuts[conflictingShortcut].sequences) {
+                                if (conflict(sequence, conflictingSequence)) {
+                                    updateKeyMap[conflictingShortcut].sequences = [
+                                        ...updateKeyMap[conflictingShortcut].sequences.filter(
+                                            (s: string) => s !== conflictingSequence,
+                                        ),
+                                    ];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            dispatch(shortcutsActions.registerShortcuts(updateKeyMap));
+        }
+    };
+}
+
+export function updateCachedSettings(settings: CombinedState['settings'], shortcuts: CombinedState['shortcuts']): void {
+    const supportedImageFilters = [ImageFilterAlias.GAMMA_CORRECTION];
+    const settingsForSaving = {
+        player: settings.player,
+        workspace: settings.workspace,
+        shortcuts: {
+            keyMap: Object.entries(shortcuts.keyMap).reduce<Record<string, { sequences: string[] }>>(
+                (acc, [key, value]) => {
+                    if (key in shortcuts.defaultState) {
+                        acc[key] = { sequences: value.sequences };
+                    }
+                    return acc;
+                }, {}),
+        },
+        imageFilters: settings.imageFilters.filter((imageFilter) => supportedImageFilters.includes(imageFilter.alias))
+            .map((imageFilter) => imageFilter.modifier.toJSON()),
+    };
+
+    localStorage.setItem('clientSettings', JSON.stringify(settingsForSaving));
 }

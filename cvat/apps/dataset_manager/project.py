@@ -1,40 +1,59 @@
-# Copyright (C) 2021 Intel Corporation
+# Copyright (C) 2021-2022 Intel Corporation
+# Copyright (C) CVAT.ai Corporation
 #
 # SPDX-License-Identifier: MIT
 
-import rq
-from typing import Any, Callable, List, Mapping, Tuple
+import io
+from collections.abc import Mapping
+from contextlib import nullcontext
+from typing import Any, Callable
 
+import rq
+from datumaro.components.errors import DatasetError, DatasetImportError, DatasetNotFoundError
+from django.conf import settings
 from django.db import transaction
 
-from cvat.apps.engine import models
-from cvat.apps.engine.serializers import DataSerializer, TaskSerializer
-from cvat.apps.engine.task import _create_thread as create_task
 from cvat.apps.dataset_manager.task import TaskAnnotation
+from cvat.apps.dataset_manager.util import TmpDirManager
+from cvat.apps.engine import models
+from cvat.apps.engine.log import DatasetLogManager
+from cvat.apps.engine.model_utils import bulk_create
+from cvat.apps.engine.rq_job_handler import RQJobMetaField
+from cvat.apps.engine.serializers import DataSerializer, TaskWriteSerializer
+from cvat.apps.engine.task import _create_thread as create_task
 
 from .annotation import AnnotationIR
-from .bindings import ProjectData, load_dataset_data
+from .bindings import CvatDatasetNotFoundError, CvatImportError, ProjectData, load_dataset_data
 from .formats.registry import make_exporter, make_importer
 
-def export_project(project_id, dst_file, format_name,
-        server_url=None, save_images=False):
+dlogger = DatasetLogManager()
+
+def export_project(
+    project_id: int,
+    dst_file: str,
+    *,
+    format_name: str,
+    server_url: str | None = None,
+    save_images: bool = False,
+    temp_dir: str | None = None,
+):
     # For big tasks dump function may run for a long time and
     # we dont need to acquire lock after the task has been initialized from DB.
     # But there is the bug with corrupted dump file in case 2 or
     # more dump request received at the same time:
-    # https://github.com/opencv/cvat/issues/217
+    # https://github.com/cvat-ai/cvat/issues/217
     with transaction.atomic():
         project = ProjectAnnotationAndData(project_id)
         project.init_from_db()
 
     exporter = make_exporter(format_name)
     with open(dst_file, 'wb') as f:
-        project.export(f, exporter, host=server_url, save_images=save_images)
+        project.export(f, exporter, host=server_url, save_images=save_images, temp_dir=temp_dir)
 
 class ProjectAnnotationAndData:
     def __init__(self, pk: int):
         self.db_project = models.Project.objects.get(id=pk)
-        self.db_tasks = models.Task.objects.filter(project__id=pk).order_by('id')
+        self.db_tasks = models.Task.objects.filter(project__id=pk).exclude(data=None).order_by('id')
 
         self.task_annotations: dict[int, TaskAnnotation] = dict()
         self.annotation_irs: dict[int, AnnotationIR] = dict()
@@ -73,14 +92,14 @@ class ProjectAnnotationAndData:
 
         data_serializer = DataSerializer(data={
             "server_files": files['media'],
-            #TODO: followed fields whould be replaced with proper input values from request in future
+            #TODO: following fields should be replaced with proper input values from request in future
             "use_cache": False,
             "use_zip_chunks": True,
             "image_quality": 70,
         })
         data_serializer.is_valid(raise_exception=True)
         db_data = data_serializer.save()
-        db_task = TaskSerializer.create(None, {
+        db_task = TaskWriteSerializer.create(None, {
             **task_fields,
             'data_id': db_data.id,
             'project_id': self.db_project.id
@@ -93,14 +112,14 @@ class ProjectAnnotationAndData:
         data['stop_frame'] = None
         data['server_files'] = list(map(split_name, data['server_files']))
 
-        create_task(db_task, data, isDatasetImport=True)
-        self.db_tasks = models.Task.objects.filter(project__id=self.db_project.id).order_by('id')
+        create_task(db_task, data, is_dataset_import=True)
+        self.db_tasks = models.Task.objects.filter(project__id=self.db_project.id).exclude(data=None).order_by('id')
         self.init_from_db()
         if project_data is not None:
             project_data.new_tasks.add(db_task.id)
             project_data.init()
 
-    def add_labels(self, labels: List[models.Label], attributes: List[Tuple[str, models.AttributeSpec]] = None):
+    def add_labels(self, labels: list[models.Label], attributes: list[tuple[str, models.AttributeSpec]] = None):
         for label in labels:
             label.project = self.db_project
             # We need label_id here, so we can't use bulk_create here
@@ -110,7 +129,7 @@ class ProjectAnnotationAndData:
             label, = filter(lambda l: l.name == label_name, labels)
             attribute.label = label
         if attributes:
-            models.AttributeSpec.objects.bulk_create([a[1] for a in attributes])
+            bulk_create(models.AttributeSpec, [a[1] for a in attributes])
 
     def init_from_db(self):
         self.reset()
@@ -121,18 +140,32 @@ class ProjectAnnotationAndData:
             self.task_annotations[task.id] = annotation
             self.annotation_irs[task.id] = annotation.ir_data
 
-    def export(self, dst_file: str, exporter: Callable, host: str='', **options):
+    def export(
+        self,
+        dst_file: io.BufferedWriter,
+        exporter: Callable[..., None],
+        *,
+        host: str = '',
+        temp_dir: str | None = None,
+        **options
+    ):
         project_data = ProjectData(
             annotation_irs=self.annotation_irs,
             db_project=self.db_project,
             host=host
         )
-        exporter(dst_file, project_data, **options)
+
+        with (
+            TmpDirManager.get_tmp_directory_for_export(
+                instance_type=self.db_project.__class__.__name__,
+            ) if not temp_dir else nullcontext(temp_dir)
+        ) as temp_dir:
+            exporter(dst_file, temp_dir, project_data, **options)
 
     def load_dataset_data(self, *args, **kwargs):
         load_dataset_data(self, *args, **kwargs)
 
-    def import_dataset(self, dataset_file, importer):
+    def import_dataset(self, dataset_file, importer, **options):
         project_data = ProjectData(
             annotation_irs=self.annotation_irs,
             db_project=self.db_project,
@@ -141,7 +174,20 @@ class ProjectAnnotationAndData:
         )
         project_data.soft_attribute_import = True
 
-        importer(dataset_file, project_data, self.load_dataset_data)
+        with TmpDirManager.get_tmp_directory() as temp_dir:
+            try:
+                importer(dataset_file, temp_dir, project_data, load_data_callback=self.load_dataset_data, **options)
+            except (DatasetNotFoundError, CvatDatasetNotFoundError) as not_found:
+                if settings.CVAT_LOG_IMPORT_ERRORS:
+                    dlogger.log_import_error(
+                        entity="project",
+                        entity_id=self.db_project.id,
+                        format_name=importer.DISPLAY_NAME,
+                        base_error=str(not_found),
+                        dir_path=temp_dir,
+                    )
+
+                raise not_found
 
         self.create({tid: ir.serialize() for tid, ir in self.annotation_irs.items() if tid in project_data.new_tasks})
 
@@ -150,15 +196,18 @@ class ProjectAnnotationAndData:
         raise NotImplementedError()
 
 @transaction.atomic
-def import_dataset_as_project(project_id, dataset_file, format_name):
+def import_dataset_as_project(src_file, project_id, format_name, conv_mask_to_poly):
     rq_job = rq.get_current_job()
-    rq_job.meta['status'] = 'Dataset import has been started...'
-    rq_job.meta['progress'] = 0.
+    rq_job.meta[RQJobMetaField.STATUS] = 'Dataset import has been started...'
+    rq_job.meta[RQJobMetaField.PROGRESS] = 0.
     rq_job.save_meta()
 
     project = ProjectAnnotationAndData(project_id)
     project.init_from_db()
 
     importer = make_importer(format_name)
-    with open(dataset_file, 'rb') as f:
-        project.import_dataset(f, importer)
+    with open(src_file, 'rb') as f:
+        try:
+            project.import_dataset(f, importer, conv_mask_to_poly=conv_mask_to_poly)
+        except (DatasetError, DatasetImportError, DatasetNotFoundError) as ex:
+            raise CvatImportError(str(ex))
